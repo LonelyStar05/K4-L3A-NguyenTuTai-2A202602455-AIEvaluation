@@ -246,23 +246,66 @@ class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        self.api_mode = os.getenv("OPENAI_API_MODE", "responses").strip().lower()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        if self.api_mode not in {"responses", "chat_completions"}:
+            raise RuntimeError(
+                "OPENAI_API_MODE must be 'responses' or 'chat_completions'"
+            )
+        client_options: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_options["base_url"] = base_url
+        self.client = OpenAI(**client_options)
         self.max_output_tokens = max_output_tokens
+        self.min_request_interval = float(
+            os.getenv("AI_MIN_REQUEST_INTERVAL", "0")
+        )
+        self.max_retries = int(os.getenv("AI_MAX_RETRIES", "4"))
+        self._last_request_started = 0.0
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        for attempt in range(self.max_retries + 1):
+            elapsed = time.monotonic() - self._last_request_started
+            wait_seconds = self.min_request_interval - elapsed
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._last_request_started = time.monotonic()
+
+            try:
+                return self._generate_once(prompt)
+            except OpenAIError as exc:
+                retryable_statuses = {429, 500, 502, 503, 504}
+                if (
+                    getattr(exc, "status_code", None) not in retryable_statuses
+                    or attempt >= self.max_retries
+                ):
+                    raise
+                time.sleep(max(15.0, self.min_request_interval))
+        raise RuntimeError("Generation retries were exhausted")
+
+    def _generate_once(self, prompt: str) -> str:
+        if self.api_mode == "chat_completions":
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=self.max_output_tokens,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+        else:
+            response = self.client.responses.create(
+                model=self.model,
+                input=prompt,
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            )
+            answer = response.output_text.strip()
         if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
+            raise RuntimeError("The configured model returned an empty answer")
         return answer
 
 
